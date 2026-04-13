@@ -1,8 +1,9 @@
 """
-ResolutionScalper — captures value as markets approach resolution.
+ResolutionScalper — captures value as politics/election markets approach resolution.
 
 Pipeline:
-    NearResolutionSource     → Fetch markets resolving within 7 days
+    NearResolutionSource     → Fetch politics markets resolving within 7 days
+    ElectionOutcomeClassifier → LLM-based filter to keep only election outcome markets
     OrderbookEnricher        → Add orderbook depth + spread
     ResolutionAnalyzer       → Estimate fair value based on time to resolution
     DiscountScorer           → Score opportunities by discount to fair value
@@ -12,7 +13,7 @@ Hybrid mode:
   - Scan: periodically find near-resolution candidates
   - Stream: watch candidates in real-time for optimal entry timing
 
-Agent skill: "What near-resolution markets have uncertainty discounts?"
+Agent skill: "What near-resolution election markets have uncertainty discounts?"
 """
 
 import logging
@@ -42,14 +43,53 @@ logger = logging.getLogger(__name__)
 
 
 class NearResolutionSource(Source):
-    """Fetch markets resolving within N days.
+    """Fetch politics markets resolving within N days.
 
-    Agent skill: "What prediction markets are resolving soon?"
+    Filters to the 'politics' category using the Gamma API's category field,
+    tags, and keyword inference from market questions.
+
+    Agent skill: "What politics prediction markets are resolving soon?"
     """
 
-    def __init__(self, gamma: GammaClient, max_days: int = 7):
+    POLITICS_KEYWORDS = {
+        "election", "president", "congress", "senate", "governor",
+        "trump", "biden", "democrat", "republican", "gop", "dnc", "rnc",
+        "electoral", "ballot", "impeach", "scotus", "supreme court",
+        "midterm", "primary", "caucus", "mayor", "parliament", "minister",
+    }
+
+    POLITICS_TAGS = {
+        "politics", "elections", "government", "congress", "senate",
+        "democrat", "republican",
+    }
+
+    def __init__(self, gamma: GammaClient, max_days: int = 7, category: str = "politics",
+                 min_yes_price: float = 0.70):
         self.gamma = gamma
         self.max_days = max_days
+        self.category = category
+        self.min_yes_price = min_yes_price
+
+    def _is_politics(self, raw: dict, question: str) -> bool:
+        """Check if a market belongs to the politics category."""
+        cat = (raw.get("category") or "").lower()
+        if cat == self.category:
+            return True
+
+        tags = raw.get("tags", [])
+        tag_labels = set()
+        for t in tags:
+            if isinstance(t, dict):
+                tag_labels.add(t.get("label", "").lower())
+            elif isinstance(t, str):
+                tag_labels.add(t.lower())
+        if tag_labels & self.POLITICS_TAGS:
+            return True
+
+        q_lower = question.lower()
+        slug_lower = (raw.get("slug") or "").lower()
+        combined = f"{q_lower} {slug_lower}"
+        return any(kw in combined for kw in self.POLITICS_KEYWORDS)
 
     async def fetch(self) -> list[MarketContext]:
         raw_markets = await self.gamma.get_markets(
@@ -67,6 +107,9 @@ class NearResolutionSource(Source):
             if not market.end_date:
                 continue
 
+            if not self._is_politics(raw, market.question):
+                continue
+
             end_naive = market.end_date.replace(tzinfo=None) if market.end_date.tzinfo else market.end_date
             days_left = (end_naive - now).total_seconds() / 86400
             if days_left < 0 or days_left > self.max_days:
@@ -80,6 +123,9 @@ class NearResolutionSource(Source):
                 continue
 
             primary = market.outcomes[0]
+
+            if primary.current_price < self.min_yes_price:
+                continue
 
             ctx = MarketContext(
                 market_id=market.condition_id,
@@ -97,6 +143,81 @@ class NearResolutionSource(Source):
             contexts.append(ctx)
 
         return contexts
+
+
+class ElectionOutcomeClassifier:
+    """Uses a local zero-shot classification model to determine whether a
+    politics market is about an election outcome.
+
+    Filters out non-election politics markets (e.g., legislation, court rulings,
+    policy decisions) and keeps only markets that are directly about who wins
+    an election, vote shares, seat counts, or electoral results.
+
+    Uses facebook/bart-large-mnli via Hugging Face transformers — runs locally,
+    no API key needed. The model is loaded lazily on first use.
+
+    Results are cached per market_id within a scan cycle to avoid redundant inference.
+    """
+
+    ELECTION_LABEL = "winning a political election"
+    NON_ELECTION_LABEL = "government policy or legislation"
+
+    def __init__(self, model: str = "facebook/bart-large-mnli", threshold: float = 0.7):
+        self._model_name = model
+        self._threshold = threshold
+        self._classifier = None
+        self._cache: dict[str, bool] = {}
+
+    def _get_classifier(self):
+        if self._classifier is None:
+            from transformers import pipeline
+            logger.info(f"ElectionClassifier: loading model {self._model_name}...")
+            self._classifier = pipeline(
+                "zero-shot-classification", model=self._model_name,
+            )
+            logger.info("ElectionClassifier: model loaded")
+        return self._classifier
+
+    def is_election_outcome(self, market_id: str, question: str) -> bool:
+        """Classify a single market question. Returns True if it's an election outcome."""
+        if market_id in self._cache:
+            return self._cache[market_id]
+
+        try:
+            classifier = self._get_classifier()
+            result = classifier(
+                question,
+                candidate_labels=[self.ELECTION_LABEL, self.NON_ELECTION_LABEL],
+            )
+            top_label = result["labels"][0]
+            top_score = result["scores"][0]
+            is_election = top_label == self.ELECTION_LABEL and top_score >= self._threshold
+            logger.debug(
+                f"ElectionClassifier: '{question[:50]}' → "
+                f"{top_label} ({top_score:.2f}) → {'KEEP' if is_election else 'SKIP'}"
+            )
+        except Exception as e:
+            logger.warning(f"ElectionClassifier error for '{question[:50]}': {e}")
+            is_election = False
+
+        self._cache[market_id] = is_election
+        return is_election
+
+    def classify_batch(self, contexts: list[MarketContext]) -> list[MarketContext]:
+        """Filter a list of MarketContexts to only election outcome markets."""
+        classified = []
+        for ctx in contexts:
+            if self.is_election_outcome(ctx.market_id, ctx.market_question):
+                classified.append(ctx)
+            else:
+                logger.debug(
+                    f"ElectionClassifier: filtered out non-election market: "
+                    f"{ctx.market_question[:60]}"
+                )
+        logger.info(
+            f"ElectionClassifier: {len(contexts)} politics → {len(classified)} election outcomes"
+        )
+        return classified
 
 
 class ResolutionAnalyzer(Analyzer):
@@ -197,10 +318,13 @@ class DiscountScorer(Scorer):
 
 
 class ResolutionScalper(Strategy):
-    """Find near-resolution markets with uncertainty discounts.
+    """Find near-resolution election markets with uncertainty discounts.
 
-    Pipeline: NearResolutionSource → OrderbookEnricher → ResolutionAnalyzer
-              → DiscountScorer → QualityFilter
+    Scoped to politics category only, with LLM classification to keep
+    only markets whose resolution depends on an election outcome.
+
+    Pipeline: NearResolutionSource (politics) → ElectionOutcomeClassifier (LLM)
+              → OrderbookEnricher → ResolutionAnalyzer → DiscountScorer → QualityFilter
     """
 
     name = "resolution"
@@ -215,11 +339,16 @@ class ResolutionScalper(Strategy):
         min_certainty: float = 0.75,
         min_discount: float = 0.02,
         min_liquidity: float = 5000,
+        min_yes_price: float = 0.70,
+        classifier_threshold: float = 0.7,
     ):
         gamma = gamma or GammaClient()
         clob = clob or ClobClient()
 
-        self.source = NearResolutionSource(gamma, max_days=max_days)
+        self.source = NearResolutionSource(
+            gamma, max_days=max_days, category="politics", min_yes_price=min_yes_price,
+        )
+        self.election_classifier = ElectionOutcomeClassifier(threshold=classifier_threshold)
         self.orderbook_enricher = None  # Import inline to avoid circular
         self._clob = clob
         self.resolution_analyzer = ResolutionAnalyzer(min_certainty=min_certainty)
@@ -231,29 +360,32 @@ class ResolutionScalper(Strategy):
 
         orderbook_enricher = OrderbookEnricher(self._clob)
 
-        # 1. Source
+        # 1. Source — politics markets only
         contexts = await self.source.fetch()
-        logger.info(f"ResolutionScalper: sourced {len(contexts)} near-resolution markets")
+        logger.info(f"ResolutionScalper: sourced {len(contexts)} near-resolution politics markets")
+
+        # 2. Classify — keep only election outcome markets via LLM
+        contexts = self.election_classifier.classify_batch(contexts)
 
         all_opportunities = []
 
         for ctx in contexts:
             try:
-                # 2. Enrich
+                # 3. Enrich
                 ctx = await orderbook_enricher.enrich(ctx)
                 if ctx.liquidity < 1000:
                     continue
 
-                # 3. Analyze
+                # 4. Analyze
                 ctx = self.resolution_analyzer.analyze(ctx)
 
-                # 4. Score
+                # 5. Score
                 opps = self.discount_scorer.score(ctx)
                 all_opportunities.extend(opps)
             except Exception as e:
                 logger.debug(f"Resolution: error on {ctx.market_question[:40]}: {e}")
 
-        # 5. Filter
+        # 6. Filter
         filtered = self.quality_filter.filter(all_opportunities)
         logger.info(f"ResolutionScalper: {len(all_opportunities)} raw → {len(filtered)} after filter")
         return filtered
